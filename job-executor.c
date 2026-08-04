@@ -22,6 +22,7 @@ typedef struct {
     char *out_buffer;
     char *stderror;
     int valid_vit;
+    int error_bit;
 } job;
 
 job jobs[10];
@@ -42,23 +43,30 @@ void sigchld_handler(int sig) {
                 //
                 if (WIFEXITED(wstatus)) {
                     // 상태 기록
-                    jobs[i].status = "DONE";
+                    if (jobs[i].error_bit == 1) {
+                        jobs[i].status = "ERROR";
+                    } else {
+                        jobs[i].status = "DONE";
+                    }
                     jobs[i].exitcode = WEXITSTATUS(wstatus);
                     int buf_count = 0;
                     int max_length = 1024;
                     jobs[i].out_buffer =
-                        (char *)malloc(max_length * sizeof(char));
+                        (char *)malloc((max_length + 1) * sizeof(char));
                     jobs[i].stderror =
-                        (char *)malloc(max_length * sizeof(char));
+                        (char *)malloc((max_length + 1) * sizeof(char));
 
                     // out_buffer 저장
                     while (1) {
                         int len = read(jobs[i].readpipe, buf, sizeof(buf));
+                        if (len <= 0)
+                            break;
                         buf_count += len;
                         if (max_length < buf_count) {
                             jobs[i].out_buffer =
                                 realloc(jobs[i].out_buffer,
-                                        (buf_count) * 2 * sizeof(char));
+                                        (buf_count + 1) * 2 * sizeof(char));
+                            max_length = (buf_count + 1) * 2;
                         }
 
                         memcpy(jobs[i].out_buffer + (buf_count - len), buf,
@@ -67,13 +75,28 @@ void sigchld_handler(int sig) {
 
                     jobs[i].out_buffer[buf_count] = 0;
                     // stderror 저장
+                    buf_count = 0;
+                    max_length = 1024;
+                    while (1) {
+                        int len = read(jobs[i].errpipe, buf, sizeof(buf));
+                        if (len <= 0)
+                            break;
+                        buf_count += len;
+                        if (max_length < buf_count) {
+                            jobs[i].stderror =
+                                realloc(jobs[i].stderror,
+                                        (buf_count + 1) * 2 * sizeof(char));
+                            max_length = (buf_count + 1) * 2;
+                        }
+
+                        memcpy(jobs[i].stderror + (buf_count - len), buf, len);
+                    }
+                    jobs[i].stderror[buf_count] = 0;
 
                     printf("%s\n", jobs[i].out_buffer);
                     printf("exitcode: %d\n", jobs[i].exitcode);
                     close(jobs[i].readpipe);
                     close(jobs[i].errpipe);
-                    free(jobs[i].out_buffer);
-                    free(jobs[i].stderror);
                     return;
                     break;
                 } else if (WIFSIGNALED(wstatus)) {
@@ -83,6 +106,8 @@ void sigchld_handler(int sig) {
             }
         }
         // 여기서 부터는 에러
+        printf("error\n");
+        return;
     }
 }
 
@@ -112,15 +137,16 @@ int main() {
         if (!strcmp("RESULT", input_arr)) { // 커맨드
             scanf("%s", input_arr);
             int id = atoi(input_arr);
+            printf("id : %d\n", id);
             if (jobs[id].valid_vit == 0) {
                 printf("작업 존재하지 않음");
-                break;
+                continue;
             }
             if (!strcmp("DONE", jobs[id].status)) {
                 printf("DONE exitcode: %d output length: %d error length: %d\n",
                        jobs[id].exitcode, (int)strlen(jobs[id].out_buffer),
                        (int)strlen(jobs[id].stderror));
-                printf("stdout : \n%s \n stderr :%s\n", jobs[id].out_buffer,
+                printf("stdout : \n%s\nstderr :\n%s\n", jobs[id].out_buffer,
                        jobs[id].stderror);
             } else if (!strcmp("RUNNING", jobs[id].status)) {
 
@@ -128,7 +154,13 @@ int main() {
             } else if (!strcmp("KILLED", jobs[id].status)) {
                 printf("KILLED\n");
             } else if (!strcmp("ERROR", jobs[id].status)) {
-                printf("ERROR\n");
+                printf(
+                    "ERROR exitcode: %d output length: %d error length: %d\n",
+                    jobs[id].exitcode, (int)strlen(jobs[id].out_buffer),
+                    (int)strlen(jobs[id].stderror));
+                printf("stdout : \n%s\nstderr :\n%s\n", jobs[id].out_buffer,
+                       jobs[id].stderror);
+
             } else if (jobs[id].valid_vit == 0) {
 
                 printf("ERR no such job");
@@ -169,6 +201,20 @@ int main() {
         pipe(pipefd);
         pipe2(err_fd, O_CLOEXEC);
         pid_t pid = fork();
+        int job_id;
+        for (int i = 0; i < 10; i++) {
+            if (jobs[i].valid_vit == 0) {
+                jobs[i].pid = pid;
+                jobs[i].status = "PENDING";
+                jobs[i].cmd = argv[0];
+                jobs[i].valid_vit = 1;
+                jobs[i].readpipe = pipefd[0];
+                jobs[i].errpipe = err_fd[0];
+                job_id = i;
+                break;
+            }
+        }
+
         if (pid < 0) {
 
             return 1;
@@ -193,19 +239,6 @@ int main() {
         close(pipefd[1]);
         close(err_fd[1]);
         int e[1] = {0};
-        int job_id;
-        for (int i = 0; i < 10; i++) {
-            if (jobs[i].valid_vit == 0) {
-                jobs[i].pid = pid;
-                jobs[i].status = "PENDING";
-                jobs[i].cmd = argv[0];
-                jobs[i].valid_vit = 1;
-                jobs[i].readpipe = pipefd[0];
-                jobs[i].errpipe = err_fd[0];
-                job_id = i;
-                break;
-            }
-        }
         read(err_fd[0], e, sizeof(e));
 
         if (e[0] == 0) {
@@ -219,6 +252,7 @@ int main() {
             // 실패
             printf("RUN error\n");
             jobs[job_id].status = "ERROR";
+            jobs[job_id].error_bit = 1;
             continue;
         }
         free(argv);
