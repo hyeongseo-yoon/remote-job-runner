@@ -26,10 +26,18 @@ typedef struct {
     int error_bit;
 } job;
 
-void sigchld_handler(int sig);
+extern job jobs[10];
+
+extern int pipefd[2];
+extern int err_fd[2];
+extern int wstatus;
+
+void sigchld_handler(int sig); // sigchld 핸들러
 void printjob(int i);
 void read_command(
-    char *input_arr); // 입력 문자열 받아서 명령어 해석. - 199줄 까지의 로직
-void fork_execute();  // 199줄 이후 로직
+    char *input_arr); // 입력 문자열 받아서 명령어 해석. - 199줄 까지의 로직.
+// input_arr는 클라이언트가 보낸 메시지 그대로 가져옴 ex) input_arr = "RUN -ls
+// -la\n"
+void fork_execute(); // 199줄 이후 로직
 
 #endif
