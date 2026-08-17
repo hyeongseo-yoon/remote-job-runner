@@ -35,8 +35,7 @@ void sigchld_handler(int sig); // sigchld 핸들러
 void printjob(int i);
 void read_command(const char *input_arr); // 입력 문자열 받아서 명령어 해석. -
                                           // 199줄 까지의 로직.
-// input_arr는 클라이언트가 보낸 메시지 그대로 가져옴 ex) input_arr = "RUN -ls
-// -la\n"
+// input_arr는 클라이언트가 보낸 메시지 그대로 가져옴 ex) input_arr = "RUN ls -la\n"
 void fork_execute(
     char *argv[]); // 199줄 이후 로직 read_command 안에서 호출하는 함수임.
 
