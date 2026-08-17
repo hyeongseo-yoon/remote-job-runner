@@ -30,7 +30,6 @@ job jobs[10];
 int pipefd[2] = {0};
 int err_fd[2] = {0};
 int wstatus;
-
 void sigchld_handler(int sig) {
     volatile int pid = 1;
     while (1) {
