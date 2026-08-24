@@ -16,7 +16,6 @@ void sigchld_handler(int sig) {
         pid = waitpid(-1, &wstatus, WNOHANG);
         if (pid <= 0)
             return;
-        char buf[1024];
         for (int i = 0; i < 10; i++) {
             if (pid == jobs[i].pid) {
                 //
@@ -28,56 +27,7 @@ void sigchld_handler(int sig) {
                         jobs[i].status = "DONE";
                     }
                     jobs[i].exitcode = WEXITSTATUS(wstatus);
-                    int buf_count = 0;
-                    int max_length = 1024;
-                    jobs[i].out_buffer =
-                        (char *)malloc((max_length + 1) * sizeof(char));
-                    jobs[i].stderror =
-                        (char *)malloc((max_length + 1) * sizeof(char));
-
-                    // out_buffer 저장
-                    while (1) {
-                        int len = read(jobs[i].readpipe, buf, sizeof(buf));
-                        if (len <= 0)
-                            break;
-                        buf_count += len;
-                        if (max_length < buf_count) {
-                            jobs[i].out_buffer =
-                                realloc(jobs[i].out_buffer,
-                                        (buf_count + 1) * 2 * sizeof(char));
-                            max_length = (buf_count + 1) * 2;
-                        }
-
-                        memcpy(jobs[i].out_buffer + (buf_count - len), buf,
-                               len);
-                    }
-
-                    jobs[i].out_buffer[buf_count] = 0;
-                    // stderror 저장
-                    buf_count = 0;
-                    max_length = 1024;
-                    while (1) {
-                        int len = read(jobs[i].errpipe, buf, sizeof(buf));
-                        if (len <= 0)
-                            break;
-                        buf_count += len;
-                        if (max_length < buf_count) {
-                            jobs[i].stderror =
-                                realloc(jobs[i].stderror,
-                                        (buf_count + 1) * 2 * sizeof(char));
-                            max_length = (buf_count + 1) * 2;
-                        }
-
-                        memcpy(jobs[i].stderror + (buf_count - len), buf, len);
-                    }
-                    jobs[i].stderror[buf_count] = 0;
-
-                    printf("%s\n", jobs[i].out_buffer);
-                    printf("exitcode: %d\n", jobs[i].exitcode);
-                    close(jobs[i].readpipe);
-                    close(jobs[i].errpipe);
                     return;
-                    break;
                 } else if (WIFSIGNALED(wstatus)) {
                     jobs[i].status = "KILLED";
                     return;
@@ -89,11 +39,61 @@ void sigchld_handler(int sig) {
         return;
     }
 }
-void printjob(int i) {
-    printf("JOB %d %s %s\n", i, jobs[i].status, jobs[i].cmd);
+
+// pipe에 남은 stdout/stderr를 읽어서 out_buffer/stderror에 채우는 함수.
+// SIGCHLD 핸들러에서 malloc/realloc을 직접 호출하면 async-signal-unsafe라
+// 여기로 분리함 - select 루프에서 해당 job의 readpipe/errpipe가 readable할
+// 때 호출하면 됨.
+void read_job_output(int job_id) {
+    char buf[1024];
+    int buf_count = 0;
+    int max_length = 1024;
+    jobs[job_id].out_buffer = (char *)malloc((max_length + 1) * sizeof(char));
+    jobs[job_id].stderror = (char *)malloc((max_length + 1) * sizeof(char));
+
+    // out_buffer 저장
+    while (1) {
+        int len = read(jobs[job_id].readpipe, buf, sizeof(buf));
+        if (len <= 0)
+            break;
+        buf_count += len;
+        if (max_length < buf_count) {
+            jobs[job_id].out_buffer = realloc(
+                jobs[job_id].out_buffer, (buf_count + 1) * 2 * sizeof(char));
+            max_length = (buf_count + 1) * 2;
+        }
+
+        memcpy(jobs[job_id].out_buffer + (buf_count - len), buf, len);
+    }
+    jobs[job_id].out_buffer[buf_count] = 0;
+
+    // stderror 저장
+    buf_count = 0;
+    max_length = 1024;
+    while (1) {
+        int len = read(jobs[job_id].errpipe, buf, sizeof(buf));
+        if (len <= 0)
+            break;
+        buf_count += len;
+        if (max_length < buf_count) {
+            jobs[job_id].stderror = realloc(
+                jobs[job_id].stderror, (buf_count + 1) * 2 * sizeof(char));
+            max_length = (buf_count + 1) * 2;
+        }
+
+        memcpy(jobs[job_id].stderror + (buf_count - len), buf, len);
+    }
+    jobs[job_id].stderror[buf_count] = 0;
+
+    close(jobs[job_id].readpipe);
+    close(jobs[job_id].errpipe);
 }
 
-void read_command(const char *input_arr) {
+void printjob(int i, int fd) {
+    dprintf(fd, "JOB %d %s %s\n", i, jobs[i].status, jobs[i].cmd);
+}
+
+void read_command(const char *input_arr, int fd) {
     // arr = "RUN ls -la\n" 형태 - 커맨드 / 토큰 단위로 나눠서 생각하면 됨.
     // 명령어 단위로 끊어서 입력을 받은 다음 비교하는 방향으로 바꿈.
     input_count = 0;
@@ -154,56 +154,58 @@ void read_command(const char *input_arr) {
     if (!strcmp("LIST", command)) { // 커맨드
         for (int i = 0; i < 10; i++) {
             if (jobs[i].valid_vit == 1) {
-                printjob(i);
+                printjob(i, fd);
             }
         }
-        printf("END\n");
+        dprintf(fd, "END\n");
         return;
     }
     if (!strcmp("RESULT", command)) { // 커맨드
-        printf("id : %d\n", id);
+        dprintf(fd, "id : %d\n", id);
         if (jobs[id].valid_vit == 0) {
-            printf("작업 존재하지 않음");
+            dprintf(fd, "작업 존재하지 않음");
             return;
         }
         if (!strcmp("DONE", jobs[id].status)) {
-            printf("DONE exitcode: %d output length: %d error length: %d\n",
-                   jobs[id].exitcode, (int)strlen(jobs[id].out_buffer),
-                   (int)strlen(jobs[id].stderror));
-            printf("stdout : \n%s\nstderr :\n%s\n", jobs[id].out_buffer,
-                   jobs[id].stderror);
+            dprintf(fd,
+                    "DONE exitcode: %d output length: %d error length: %d\n",
+                    jobs[id].exitcode, (int)strlen(jobs[id].out_buffer),
+                    (int)strlen(jobs[id].stderror));
+            dprintf(fd, "stdout : \n%s\nstderr :\n%s\n", jobs[id].out_buffer,
+                    jobs[id].stderror);
         } else if (!strcmp("RUNNING", jobs[id].status)) {
 
-            printf("RUNING\n");
+            dprintf(fd, "RUNING\n");
         } else if (!strcmp("KILLED", jobs[id].status)) {
-            printf("KILLED\n");
+            dprintf(fd, "KILLED\n");
         } else if (!strcmp("ERROR", jobs[id].status)) {
-            printf("ERROR exitcode: %d output length: %d error length: %d\n",
-                   jobs[id].exitcode, (int)strlen(jobs[id].out_buffer),
-                   (int)strlen(jobs[id].stderror));
-            printf("stdout : \n%s\nstderr :\n%s\n", jobs[id].out_buffer,
-                   jobs[id].stderror);
+            dprintf(fd,
+                    "ERROR exitcode: %d output length: %d error length: %d\n",
+                    jobs[id].exitcode, (int)strlen(jobs[id].out_buffer),
+                    (int)strlen(jobs[id].stderror));
+            dprintf(fd, "stdout : \n%s\nstderr :\n%s\n", jobs[id].out_buffer,
+                    jobs[id].stderror);
 
         } else if (jobs[id].valid_vit == 0) {
 
-            printf("ERR no such job");
+            dprintf(fd, "ERR no such job");
         }
         return;
     }
     if (!strcmp("KILL", command)) { // 커맨드
         if (!strcmp(jobs[id].status, "DONE")) {
-            printf("ERR job already finished\n");
+            dprintf(fd, "ERR job already finished\n");
             return;
         }
         kill(jobs[id].pid, SIGTERM);
         return;
     }
     if (!strcmp("RUN", command)) { // 커맨드
-        fork_execute(argv);
+        fork_execute(argv, fd);
         return;
     }
 }
-void fork_execute(char *argv[]) {
+void fork_execute(char *argv[], int fd) {
     pipe(pipefd);
     pipe2(err_fd, O_CLOEXEC);
     pid_t pid = fork();
@@ -254,7 +256,7 @@ void fork_execute(char *argv[]) {
 
     } else {
         // 실패
-        printf("RUN error\n");
+        dprintf(fd, "RUN error\n");
         jobs[job_id].status = "ERROR";
         jobs[job_id].error_bit = 1;
     }
