@@ -44,50 +44,47 @@ void sigchld_handler(int sig) {
 // SIGCHLD 핸들러에서 malloc/realloc을 직접 호출하면 async-signal-unsafe라
 // 여기로 분리함 - select 루프에서 해당 job의 readpipe/errpipe가 readable할
 // 때 호출하면 됨.
-void read_job_output(int job_id) {
+void read_job_output(int job_id, int is_stderr) {
     char buf[1024];
     int buf_count = 0;
     int max_length = 1024;
-    jobs[job_id].out_buffer = (char *)malloc((max_length + 1) * sizeof(char));
-    jobs[job_id].stderror = (char *)malloc((max_length + 1) * sizeof(char));
+    int pipe_fd = is_stderr ? jobs[job_id].errpipe : jobs[job_id].readpipe;
+    char **out = is_stderr ? &jobs[job_id].stderror : &jobs[job_id].out_buffer;
 
-    // out_buffer 저장
+    *out = (char *)malloc((max_length + 1) * sizeof(char));
+
     while (1) {
-        int len = read(jobs[job_id].readpipe, buf, sizeof(buf));
+        int len = read(pipe_fd, buf, sizeof(buf));
         if (len <= 0)
             break;
         buf_count += len;
         if (max_length < buf_count) {
-            jobs[job_id].out_buffer = realloc(
-                jobs[job_id].out_buffer, (buf_count + 1) * 2 * sizeof(char));
+            *out = realloc(*out, (buf_count + 1) * 2 * sizeof(char));
             max_length = (buf_count + 1) * 2;
         }
 
-        memcpy(jobs[job_id].out_buffer + (buf_count - len), buf, len);
+        memcpy(*out + (buf_count - len), buf, len);
     }
-    jobs[job_id].out_buffer[buf_count] = 0;
+    (*out)[buf_count] = 0;
 
-    // stderror 저장
-    buf_count = 0;
-    max_length = 1024;
-    while (1) {
-        int len = read(jobs[job_id].errpipe, buf, sizeof(buf));
-        if (len <= 0)
-            break;
-        buf_count += len;
-        if (max_length < buf_count) {
-            jobs[job_id].stderror = realloc(
-                jobs[job_id].stderror, (buf_count + 1) * 2 * sizeof(char));
-            max_length = (buf_count + 1) * 2;
-        }
-
-        memcpy(jobs[job_id].stderror + (buf_count - len), buf, len);
-    }
-    jobs[job_id].stderror[buf_count] = 0;
-
-    close(jobs[job_id].readpipe);
-    close(jobs[job_id].errpipe);
+    close(pipe_fd);
 }
+
+// jobs 슬롯 초기화. main 시작할 때 한 번 호출.
+void init_jobs(void) {
+    for (int i = 0; i < 10; i++) {
+        jobs[i].valid_vit = 0;
+        jobs[i].readpipe = -1;
+        jobs[i].errpipe = -1;
+        jobs[i].pid = -1;
+        jobs[i].status = "EMPTY";
+        jobs[i].out_buffer = NULL;
+        jobs[i].stderror = NULL;
+    }
+}
+
+// SIGCHLD 핸들러 등록. main 시작할 때 한 번 호출.
+void install_sigchld_handler(void) { signal(SIGCHLD, sigchld_handler); }
 
 void printjob(int i, int fd) {
     dprintf(fd, "JOB %d %s %s\n", i, jobs[i].status, jobs[i].cmd);
@@ -162,7 +159,7 @@ void read_command(const char *input_arr, int fd) {
     }
     if (!strcmp("RESULT", command)) { // 커맨드
         dprintf(fd, "id : %d\n", id);
-        if (jobs[id].valid_vit == 0) {
+        if (id < 0 || id >= 10 || jobs[id].valid_vit == 0) {
             dprintf(fd, "작업 존재하지 않음");
             return;
         }
@@ -193,6 +190,10 @@ void read_command(const char *input_arr, int fd) {
         return;
     }
     if (!strcmp("KILL", command)) { // 커맨드
+        if (id < 0 || id >= 10 || jobs[id].valid_vit == 0) {
+            dprintf(fd, "ERR no such job\n");
+            return;
+        }
         if (!strcmp(jobs[id].status, "DONE")) {
             dprintf(fd, "ERR job already finished\n");
             return;
