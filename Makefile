@@ -1,15 +1,15 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -g
 
-SRC = job-executor.c
-BIN = job-executor
+all: server client
 
-all: $(BIN)
+server: server.c job.c job.h
+	$(CC) $(CFLAGS) -o $@ server.c job.c
 
-$(BIN): $(SRC)
-	$(CC) $(CFLAGS) -o $(BIN) $(SRC)
+client: client.c
+	$(CC) $(CFLAGS) -o $@ client.c
 
 clean:
-	rm -f $(BIN)
+	rm -f server client
 
 .PHONY: all clean
