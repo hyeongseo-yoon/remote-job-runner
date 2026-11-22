@@ -1,8 +1,11 @@
+#define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -15,11 +18,15 @@
 
 #define MAX_CLIENTS 16
 #define INPUT_CAP 4096
+#define MIN_TOKEN_LEN 16
+
+static char auth_token[128];
 
 typedef struct {
     int fd;
     char input_buffer[INPUT_CAP];
     size_t input_len;
+    int authed;
 } client_t;
 
 static client_t clients[MAX_CLIENTS];
@@ -28,6 +35,7 @@ static void init_clients(void){
     for(int i = 0; i<MAX_CLIENTS; i++){
         clients[i].fd = -1;
         clients[i].input_len = 0;
+        clients[i].authed = 0;
     }
 }
 
@@ -36,6 +44,7 @@ static int add_client(int fd){
         if(clients[i].fd == -1){
             clients[i].fd = fd;
             clients[i].input_len = 0;
+            clients[i].authed = 0;
             return i;
         }
     }
@@ -48,13 +57,37 @@ static void close_client(int client_index){
     }
     clients[client_index].fd = -1;
     clients[client_index].input_len = 0;
+    clients[client_index].authed = 0;
 }
 
-static int find_client_index(int fd){
-    for (int i = 0; i<MAX_CLIENTS; i++){
-        if(clients[i].fd == fd) return i;
+// 길이/내용 모두 시간차 없이 비교
+static int token_equal(const char *a, const char *b){
+    size_t la = strlen(a), lb = strlen(b);
+    unsigned char diff = (la != lb);
+    for(size_t i = 0; i < lb; i++) diff |= (unsigned char)(a[i < la ? i : 0] ^ b[i]);
+    return diff == 0;
+}
+
+// JOB_RUNNER_TOKEN 환경변수를 쓰고, 없으면 랜덤 토큰을 만들어서 출력
+static int init_token(void){
+    const char *env = getenv("JOB_RUNNER_TOKEN");
+    if(env){
+        size_t len = strlen(env);
+        if(len < MIN_TOKEN_LEN || len >= sizeof(auth_token)){
+            fprintf(stderr, "JOB_RUNNER_TOKEN 길이는 %d~%zu자여야 함\n", MIN_TOKEN_LEN, sizeof(auth_token) - 1);
+            return -1;
+        }
+        memcpy(auth_token, env, len + 1);
+        return 0;
     }
-    return -1;
+    unsigned char rnd[16];
+    if(getrandom(rnd, sizeof(rnd), 0) != (ssize_t)sizeof(rnd)){
+        perror("getrandom");
+        return -1;
+    }
+    for(size_t i = 0; i < sizeof(rnd); i++) snprintf(auth_token + i * 2, 3, "%02x", rnd[i]);
+    printf("토큰 생성됨: %s\n", auth_token);
+    return 0;
 }
 
 // 개행 문자를 중심으로 한줄을 잘라내서 파싱하는 함수
@@ -83,6 +116,17 @@ static void process_complete_lines(int client_index){
         memmove(client->input_buffer, client->input_buffer + consumed, client->input_len-consumed);
     
         client->input_len -= consumed;
+
+        if(!client->authed){
+            if(strncmp(line, "AUTH ", 5) == 0 && token_equal(line + 5, auth_token)){
+                client->authed = 1;
+                dprintf(client->fd, "OK\n");
+                continue;
+            }
+            dprintf(client->fd, "ERR auth failed\n");
+            close_client(client_index);
+            return;
+        }
 
         read_command(line, client->fd);
     }
@@ -121,9 +165,6 @@ static void handle_client_input(int client_index){
 
     printf("[recv] index=%d fd=%d received=%zd, total=%zu\n", client_index, client->fd, n, client->input_len);
     
-    //인자 길이 만큼 문자열 출력 법
-    printf("[buffer] %.*s\n", (int)client->input_len, client->input_buffer);
-
     process_complete_lines(client_index);
 }
 
@@ -132,6 +173,7 @@ int main() {
     int server_fd;
     struct sockaddr_in server_addr;
 
+    if(init_token() < 0) return 1;
     init_clients();
     
     init_jobs();
@@ -139,7 +181,7 @@ int main() {
     //for select
     fd_set master_set, read_set;
 
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    server_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (server_fd < 0) {
         perror("socket");
         return 1;
@@ -155,7 +197,7 @@ int main() {
 
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 인증 있어도 외부 노출 금지
     server_addr.sin_port = htons(PORT);
 
     if (bind(server_fd, (struct sockaddr *)&server_addr,
@@ -173,9 +215,7 @@ int main() {
 
     FD_ZERO(&master_set);
     FD_SET(server_fd, &master_set);
-    int current_max_fd = server_fd;
-
-    printf("서버 대기 중...\n");
+    printf("서버 대기 중... (127.0.0.1:%d)\n", PORT);
 
     while (1) {
 
@@ -188,7 +228,7 @@ int main() {
             if(clients[i].fd > current_max_fd) current_max_fd = clients[i].fd;
         }
 
-        for(int i = 0; i<10; i++){
+        for(int i = 0; i<MAX_JOBS; i++){
             if(jobs[i].valid_vit != 1) continue;
 
             if(jobs[i].readpipe >= 0){
@@ -216,7 +256,7 @@ int main() {
         if(FD_ISSET(server_fd, &read_set)){
             struct sockaddr_in client_addr;
             socklen_t client_len = sizeof(client_addr);
-            int new_client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+            int new_client_fd = accept4(server_fd, (struct sockaddr *)&client_addr, &client_len, SOCK_CLOEXEC);
             
             if(new_client_fd < 0){
                 perror("accept");
@@ -232,8 +272,6 @@ int main() {
             }
 
             FD_SET(new_client_fd, &master_set);
-
-            if(new_client_fd > current_max_fd) current_max_fd = new_client_fd;
 
             printf("접속: index=%d, fd=%d, ip=%s\n", client_index, new_client_fd, inet_ntoa(client_addr.sin_addr));
         }
@@ -251,7 +289,7 @@ int main() {
             }
         }
         //3. job stdout/stderr pipe 처리
-        for(int i = 0; i<10; i++){
+        for(int i = 0; i<MAX_JOBS; i++){
             if(jobs[i].valid_vit !=1) continue;
 
             if(jobs[i].readpipe >=0 && FD_ISSET(jobs[i].readpipe, &read_set)){
