@@ -27,11 +27,27 @@ JOB_RUNNER_TOKEN=change-me-0123456789 ./client      # 다른 터미널에서
 
 ```
 $ JOB_RUNNER_TOKEN=change-me-0123456789 ./client
-RUN ls -la
+RUN echo hello
 OK 0
+RUN no-such-cmd
+OK 1
+RUN sleep 30
+OK 2
+LIST
+JOB 0 DONE echo hello
+JOB 1 ERROR no-such-cmd
+JOB 2 RUNNING sleep 30
+END
+KILL 2
+OK
 RESULT 0
-DONE 0 412 0
-(stdout 412바이트)
+DONE 0 6 0
+hello
+RESULT 1
+ERROR 127 0 39
+exec failed: No such file or directory
+RESULT 2
+KILLED
 ```
 
 ## 프로토콜
